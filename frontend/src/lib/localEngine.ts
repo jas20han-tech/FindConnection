@@ -276,27 +276,33 @@ function buildNarrative(
     if (path && path.edgeIds.length > 0) {
       const start = nodeMap.get(path.nodeIds[0]);
       const end = nodeMap.get(path.nodeIds[path.nodeIds.length - 1]);
-      const lines = [
-        `**${start?.name ?? path.nodeIds[0]}** reaches **${end?.name ?? path.nodeIds[path.nodeIds.length - 1]}** through a **${path.edgeIds.length}-hop verified route** in the knowledge graph.\n`,
+      const startName = start?.name ?? path.nodeIds[0];
+      const endName = end?.name ?? path.nodeIds[path.nodeIds.length - 1];
+      const lines: string[] = [
+        `The story connecting **${startName}** and **${endName}** unfolds across a **${path.edgeIds.length}-hop narrative path** in the knowledge graph.\n`,
       ];
       path.edgeIds.forEach((edgeId, index) => {
         const edge = edgeMap.get(edgeId);
         if (!edge) return;
         const source = nodeMap.get(path.nodeIds[index]);
         const target = nodeMap.get(path.nodeIds[index + 1]);
-        lines.push(
-          `- **${source?.name ?? edge.source}** ${verb(edge)} **${target?.name ?? edge.target}**${dateSuffix(edge)}. ${edge.description} [[${edge.id}]]`,
-        );
+        const sName = source?.name ?? edge.source;
+        const tName = target?.name ?? edge.target;
+        if (edge.description) {
+          lines.push(`- **${sName}** and **${tName}**: ${edge.description} [[${edge.id}]]`);
+        } else {
+          lines.push(`- **${sName}** ${verb(edge)} **${tName}**${dateSuffix(edge)}. [[${edge.id}]]`);
+        }
       });
       const strongest = path.edgeIds
         .map((edgeId) => edgeMap.get(edgeId))
         .filter((edge): edge is GraphEdge => Boolean(edge))
         .sort((a, b) => b.strength - a.strength)[0];
-      if (strongest) {
+      if (strongest && strongest.description) {
         const source = nodeMap.get(strongest.source);
         const target = nodeMap.get(strongest.target);
         lines.push(
-          `\nThe strongest link is **${source?.name ?? strongest.source} → ${target?.name ?? strongest.target}** (${strongest.type}, strength ${strongest.strength}/10), supported by \`${strongest.source_doc ?? "the source corpus"}\`${strongest.source_page ? `, page ${strongest.source_page}` : ""}.`,
+          `\n**Key Story Milestone:** The central connection between **${source?.name ?? strongest.source}** and **${target?.name ?? strongest.target}** (${strongest.type}, strength ${strongest.strength}/10) anchors this dynamic: ${strongest.description} [[${strongest.id}]].`,
         );
       }
       return lines.join("\n");

@@ -29,6 +29,7 @@ next-env.d.ts
 uploads/
 backend/data/runtime_graph.json
 backend/data/runtime_graph.json.tmp
+backend/data/networks/
 data/neo4j/
 data/postgres/
 data/redis/

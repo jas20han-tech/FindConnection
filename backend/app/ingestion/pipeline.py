@@ -15,6 +15,12 @@ from app.ingestion.extractor import ExtractionEngine
 from app.ingestion.indexer import GraphIndexer
 from app.ingestion.parser import parse_document
 from app.ingestion.resolver import EntityResolver
+from app.ingestion.verification import (
+    attach_evidence,
+    attach_resolved_evidence,
+    build_verification_network,
+    save_verification_network,
+)
 from app.runtime import get_repository
 
 logger = logging.getLogger(__name__)
@@ -81,12 +87,14 @@ async def run_ingestion(job_id: str, file_path: str | Path, filename: str | None
 
         # ---------------------------------------------------------- resolve
         await job_store.update(job_id, stage_name="RESOLVING", percent=58.0)
-        # Each upload replaces the previous document: clear the old graph before
-        # resolving so entities are not matched against nodes that are about to go.
-        reset_for_document = getattr(repository, "reset_for_document", None)
-        if reset_for_document is not None:
-            await reset_for_document(document.title)
-            replaced = True
+        accumulate = bool(settings.graph_accumulate)
+        if not accumulate:
+            # Replace mode: clear the old graph before resolving so entities are
+            # not matched against nodes that are about to go.
+            reset_for_document = getattr(repository, "reset_for_document", None)
+            if reset_for_document is not None:
+                await reset_for_document(document.title)
+                replaced = True
         existing_nodes, _ = await repository.get_all()
         resolver = EntityResolver(existing_nodes)
         resolved = await resolver.resolve(report)
@@ -97,6 +105,18 @@ async def run_ingestion(job_id: str, file_path: str | Path, filename: str | None
             relationships_extracted=len(resolved.relationships),
             counts_by_type=dict(counts_by_type),
         )
+
+        # Attach per-document evidence now: the graph store accumulates it while
+        # indexing, so the export and the live graph agree on every quote.
+        network: dict | None = None
+        network_warnings: list[str] = []
+        try:
+            attach_resolved_evidence(document, resolved, chunks)
+            network = build_verification_network(
+                document, resolved, chunks, report, warnings=network_warnings
+            )
+        except Exception as exc:  # never fail an ingest because evidence failed
+            logger.warning("Evidence attachment failed: %s", exc)
 
         # ---------------------------------------------------------- index
         await job_store.update(job_id, stage_name="INDEXING", percent=82.0)
@@ -127,6 +147,31 @@ async def run_ingestion(job_id: str, file_path: str | Path, filename: str | None
                 logger.warning("Community recompute failed: %s", exc)
         await repository.refresh_analytics()
         stats = await repository.stats()
+
+        # ---------------------------------------------------------- verification export
+        network_file: str | None = None
+        network_path: str | None = None
+        network_summary: dict | None = None
+        network_error: str | None = None
+        try:
+            if network is None:
+                attach_resolved_evidence(document, resolved, chunks)
+                network = build_verification_network(
+                    document, resolved, chunks, report, warnings=network_warnings
+                )
+            # Pull the accumulated history (previous documents) into the export.
+            graph_nodes, graph_edges = await repository.get_all()
+            attach_evidence(network, graph_nodes, graph_edges)
+            network["warnings"] = list(network_warnings)
+            saved_path = save_verification_network(network, filename)
+            network_file = saved_path.name
+            network_path = str(saved_path)
+            network_summary = network["summary"]
+            logger.info("Wrote verification network %s", saved_path)
+        except Exception as exc:  # never fail an ingest because the export failed
+            network_error = str(exc)
+            logger.warning("Verification network export failed: %s", exc)
+
         await job_store.update(
             job_id,
             stage_name="COMPLETED",
@@ -137,6 +182,11 @@ async def run_ingestion(job_id: str, file_path: str | Path, filename: str | None
             document_count=stats.document_count,
             nodes_added=int(counts.get("entities_created", 0)),
             edges_added=int(counts.get("relationships_created", 0)),
+            network_file=network_file,
+            network_path=network_path,
+            network_summary=network_summary,
+            network_error=network_error,
+            graph_mode="accumulate" if accumulate else "replace",
         )
         await _persist_job_snapshot(job_id, document.title, stats)
         logger.info(

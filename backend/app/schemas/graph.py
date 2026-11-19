@@ -25,6 +25,8 @@ class GraphNode(BaseModel):
     year: int | None = None
     aliases: list[str] = Field(default_factory=list)
     documents: list[str] = Field(default_factory=list)
+    # Accumulated source evidence: [{doc, page, quote, verified, chunk_id}]
+    evidence: list[dict] = Field(default_factory=list)
 
     @property
     def search_text(self) -> str:
@@ -38,6 +40,7 @@ class GraphEdge(BaseModel):
     type: str
     description: str = ""
     strength: int = 5
+    sentiment: str = "NEUTRAL"
     date: str | None = None
     date_confidence: str = "unknown"
     source_doc: str | None = None
@@ -45,6 +48,9 @@ class GraphEdge(BaseModel):
     source_page: int | None = None
     status: EdgeStatus = "ACTIVE"
     year: int | None = None
+    # Every document that asserted this relationship, plus accumulated evidence.
+    documents: list[str] = Field(default_factory=list)
+    evidence: list[dict] = Field(default_factory=list)
 
 
 class GraphStats(BaseModel):

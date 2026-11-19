@@ -6,7 +6,11 @@ export type EntityType =
   | "LOCATION"
   | "REGULATION"
   | "EVENT"
-  | "ORGANIZATION";
+  | "ORGANIZATION"
+  | "CHARACTER"
+  | "FACTION"
+  | "CONCEPT"
+  | "ARTIFACT";
 
 export type QueryMode = "CONNECTION" | "IMPACT" | "TEMPORAL" | "GLOBAL" | "ENTITY";
 export type ColorMode = "DOCUMENT" | "TYPE" | "COMMUNITY" | "CENTRALITY";
@@ -34,6 +38,7 @@ export interface GraphEdge {
   type: string;
   description: string;
   strength: number;
+  sentiment?: string;
   date?: string | null;
   date_confidence?: string;
   source_doc?: string | null;

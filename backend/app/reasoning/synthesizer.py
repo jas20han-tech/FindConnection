@@ -173,39 +173,67 @@ def _connection_narrative(
     if path and path.found and path.edge_ids:
         start = node_map.get(path.node_ids[0])
         end = node_map.get(path.node_ids[-1])
-        lines = [
-            f"**{start.name if start else path.node_ids[0]}** reaches "
-            f"**{end.name if end else path.node_ids[-1]}** through a "
-            f"{path.hops}-hop verified route in the knowledge graph.\n"
-        ]
+        start_name = start.name if start else path.node_ids[0]
+        end_name = end.name if end else path.node_ids[-1]
+        hops = path.hops
+        
+        # Build the story narrative
+        story_parts = []
+        story_parts.append(
+            f"The story between **{start_name}** and **{end_name}** unfolds through a "
+            f"{hops}-hop chain of relationships extracted from the uploaded narrative.\n"
+        )
+        
+        # Weave the chain into a narrative
+        narrative_chain = []
         for index, edge_id in enumerate(path.edge_ids):
             edge = edge_map.get(edge_id)
             if not edge:
                 continue
-            source = node_map.get(path.node_ids[index])
-            target = node_map.get(path.node_ids[index + 1])
-            lines.append(
-                f"- **{source.name if source else edge.source}** {_verb(edge)} "
-                f"**{target.name if target else edge.target}**{_date_suffix(edge)}. "
-                f"{edge.description} [[{edge.id}]]"
-            )
+            source_node = node_map.get(path.node_ids[index])
+            target_node = node_map.get(path.node_ids[index + 1])
+            source_name = source_node.name if source_node else edge.source
+            target_name = target_node.name if target_node else edge.target
+            
+            # Use the edge description as the story element
+            edge_desc = edge.description.strip()
+            if edge_desc:
+                narrative_chain.append(
+                    f"**{source_name}** and **{target_name}** are bound by this connection: {edge_desc} [[{edge.id}]]"
+                )
+            else:
+                narrative_chain.append(
+                    f"**{source_name}** {_verb(edge)} **{target_name}**{_date_suffix(edge)} [[{edge.id}]]"
+                )
+        
+        if narrative_chain:
+            story_parts.append(" ".join(narrative_chain) + "\n")
+        
+        # Add context about the full chain
+        chain_names = []
+        for nid in path.node_ids:
+            n = node_map.get(nid)
+            chain_names.append(n.name if n else nid)
+        story_parts.append(
+            f"This web of connections — **{' → '.join(chain_names)}** — reveals how "
+            f"**{start_name}** ultimately became linked to **{end_name}** through shared events, "
+            f"alliances, and the intertwined narrative of the story."
+        )
+        
         strongest = max(
             (edge_map[eid] for eid in path.edge_ids if eid in edge_map),
             key=lambda edge: edge.strength,
             default=None,
         )
-        if strongest:
-            source = node_map.get(strongest.source)
-            target = node_map.get(strongest.target)
-            lines.append(
-                f"\nThe strongest link is **{source.name if source else strongest.source} → "
-                f"{target.name if target else strongest.target}** "
-                f"({strongest.type}, strength {strongest.strength}/10), supported by "
-                f"`{strongest.source_doc or 'the source corpus'}`"
-                + (f", page {strongest.source_page}" if strongest.source_page else "")
-                + "."
+        if strongest and strongest.description:
+            story_parts.append(
+                f"\n\nAt the heart of this dynamic is the relationship between "
+                f"**{node_map.get(strongest.source).name if node_map.get(strongest.source) else strongest.source}** "
+                f"and **{node_map.get(strongest.target).name if node_map.get(strongest.target) else strongest.target}**: "
+                f"{strongest.description} [[{strongest.id}]]"
             )
-        return "\n".join(lines)
+        
+        return "\n".join(story_parts)
 
     seeds = [node_map[node_id] for node_id in context.highlighted_node_ids if node_id in node_map]
     if not seeds:
@@ -333,13 +361,20 @@ def _global_narrative(context: SynthesisContext, node_map: dict[str, GraphNode])
 
 
 # --------------------------------------------------------------------------- LLM narrative
-SYSTEM_PROMPT = """You are a graph intelligence analyst writing a grounded investigative brief.
+SYSTEM_PROMPT = """You are an insightful narrative storyteller and relational intelligence analyst.
+Your objective is to reveal the story connecting entities across the knowledge graph.
 Rules:
-- Use ONLY the supplied facts. Never invent entities, dates or causal claims.
-- Every factual sentence must end with a citation anchor in the form [[edge_id]] using the
-  exact edge ids supplied. An anchor may be reused.
-- Write 2-4 short markdown paragraphs. Bold entity names. No preamble, no meta commentary.
-- If the facts do not answer the question, say so plainly and explain what is missing."""
+1. Weave a Narrative Arc:
+   - Do NOT just list edges as isolated facts or bullet points.
+   - Tell the cohesive story of how these entities relate: explain how one event or relationship leads into the next, what tensions or motivations exist, and the overarching story connecting them.
+   - For multi-hop paths (A → B → C), describe the causal or dramatic chain of events connecting the start and destination entities.
+2. Evidence & Grounding:
+   - Every factual claim or story milestone must cite its graph evidence using the exact edge anchor format [[edge_id]].
+   - Use only the relationships provided in the graph context. Do not fabricate outside lore.
+3. Formatting:
+   - Write 2 to 4 engaging, well-structured markdown paragraphs.
+   - Bold entity names (e.g., **Keita Amano**, **Karen Tendou**).
+   - If there is drama, conflict, irony, or strategic nuance in the relationship, highlight it clearly."""
 
 
 def _prompt(context: SynthesisContext) -> str:
@@ -349,11 +384,12 @@ def _prompt(context: SynthesisContext) -> str:
     for edge in context.relevant_edges():
         source = node_map.get(edge.source)
         target = node_map.get(edge.target)
+        sentiment_info = f" | dynamic={edge.sentiment}" if getattr(edge, "sentiment", None) and edge.sentiment != "NEUTRAL" else ""
         rows.append(
             f"[{edge.id}] {source.name if source else edge.source} --{edge.type}--> "
-            f"{target.name if target else edge.target} | date={edge.date or 'unknown'} | "
+            f"{target.name if target else edge.target}{sentiment_info} | date={edge.date or 'unknown'} | "
             f"strength={edge.strength} | source={edge.source_doc or 'seed'} "
-            f"p{edge.source_page or '?'} | {edge.description}"
+            f"p{edge.source_page or '?'} | story={edge.description}"
         )
     if context.impact:
         impact = context.impact

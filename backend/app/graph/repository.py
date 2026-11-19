@@ -62,6 +62,10 @@ VALID_TYPES: set[str] = {
     "REGULATION",
     "EVENT",
     "ORGANIZATION",
+    "CHARACTER",
+    "FACTION",
+    "CONCEPT",
+    "ARTIFACT",
 }
 
 
@@ -85,6 +89,124 @@ def year_of(date: str | None) -> int | None:
 def clean_type(value: str | None) -> EntityType:
     candidate = (value or "ORGANIZATION").upper().strip()
     return candidate if candidate in VALID_TYPES else "ORGANIZATION"  # type: ignore[return-value]
+
+
+# Labels the extractor falls back to when it cannot classify an entity. When the
+# same entity is seen again with a specific label, the specific label wins.
+GENERIC_TYPES: set[str] = {"ORGANIZATION", "CONCEPT"}
+
+# Parser artifacts such as letter-spaced headers ("F K O N O H A") must never
+# beat a real description when two documents are merged.
+_SPACED_TEXT = re.compile(r"(?:\b[A-Za-z]\s+){8,}")
+
+
+def merge_type(current: str | None, incoming: str | None) -> EntityType:
+    """Keep a specific label; let a specific label replace a generic fallback."""
+    current_type = clean_type(current)
+    incoming_type = clean_type(incoming)
+    if incoming_type == current_type:
+        return current_type
+    if current_type in GENERIC_TYPES and incoming_type not in GENERIC_TYPES:
+        return incoming_type
+    return current_type
+
+
+def merge_description(current: str | None, incoming: str | None) -> str:
+    """Prefer readable prose over parser artifacts and empty stubs."""
+    existing = (current or "").strip()
+    candidate = (incoming or "").strip()
+    if not candidate:
+        return existing
+    if not existing:
+        return candidate
+    existing_broken = bool(_SPACED_TEXT.search(existing))
+    candidate_broken = bool(_SPACED_TEXT.search(candidate))
+    if candidate_broken != existing_broken:
+        return existing if candidate_broken else candidate
+    return candidate if len(candidate) > len(existing) else existing
+
+
+# Relationships where direction carries no meaning. They share one canonical edge
+# id so A→B and B→A merge instead of appearing twice.
+SYMMETRIC_RELATIONS = {
+    "RELATED_TO",
+    "ALLY_OF",
+    "RIVAL_TO",
+    "COMPETES_WITH",
+    "PARTNERS_WITH",
+    "MARRIED_TO",
+    "SIBLING_OF",
+    "FRIEND_OF",
+    "FAMILY_OF",
+    "KNOWS",
+}
+
+
+def canonical_edge_id(source: str, target: str, relation_type: str | None) -> str:
+    relation = (relation_type or "RELATED_TO").upper()
+    if relation in SYMMETRIC_RELATIONS:
+        first, second = sorted([source, target])
+        return f"{first}__{relation.lower()}__{second}"
+    return f"{source}__{relation.lower()}__{target}"
+
+
+def encode_evidence(items: list[dict] | None) -> list[str]:
+    """Neo4j properties may hold lists of primitives, not lists of maps."""
+    return [
+        json.dumps(item, ensure_ascii=False)
+        for item in items or []
+        if isinstance(item, dict)
+    ]
+
+
+def decode_evidence(raw: Any) -> list[dict]:
+    decoded: list[dict] = []
+    for item in raw or []:
+        if isinstance(item, dict):
+            decoded.append(item)
+            continue
+        try:
+            parsed = json.loads(item)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            decoded.append(parsed)
+    return decoded
+
+
+def merge_evidence(
+    existing: list[dict],
+    incoming: list[dict] | None,
+    *,
+    source_doc: str | None = None,
+    chunk_id: str | None = None,
+    limit: int = 50,
+) -> None:
+    """Append de-duplicated evidence items in place."""
+    seen = {
+        (item.get("doc") or "", item.get("page"), (item.get("quote") or "")[:240])
+        for item in existing
+        if isinstance(item, dict)
+    }
+    for item in incoming or []:
+        if not isinstance(item, dict):
+            continue
+        enriched = dict(item)
+        if source_doc:
+            enriched.setdefault("doc", source_doc)
+        if chunk_id:
+            enriched.setdefault("chunk_id", chunk_id)
+        key = (
+            enriched.get("doc") or "",
+            enriched.get("page"),
+            (enriched.get("quote") or "")[:240],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        existing.append(enriched)
+        if len(existing) >= limit:
+            break
 
 
 class GraphRepository(ABC):
@@ -154,8 +276,8 @@ class InMemoryGraphRepository(GraphRepository):
         # Every ingested document is tracked, even when it only repeats entities and
         # adds no relationships — otherwise it silently disappears from the count.
         self._documents: set[str] = set()
-        # Each upload replaces the previous one: the first write for a new
-        # source_doc clears the graph so only that document's graph remains.
+        # In accumulate mode every document is merged into one evolving graph; the
+        # pipeline only clears first when GRAPH_ACCUMULATE=false.
         self._active_document: str | None = None
         self._lock = asyncio.Lock()
         self._save_lock = asyncio.Lock()
@@ -284,8 +406,6 @@ class InMemoryGraphRepository(GraphRepository):
         and document names are dropped so only the newest document's graph remains.
         """
         async with self._lock:
-            if self._nodes and source_doc == self._active_document:
-                return
             self._nodes.clear()
             self._edges.clear()
             self._communities.clear()
@@ -330,6 +450,7 @@ class InMemoryGraphRepository(GraphRepository):
             type=(raw.get("type") or "RELATED_TO").upper(),
             description=raw.get("description", ""),
             strength=int(raw.get("strength", 5)),
+            sentiment=raw.get("sentiment", "NEUTRAL"),
             date=raw.get("date"),
             date_confidence=raw.get("date_confidence", "unknown"),
             source_doc=raw.get("source_doc"),
@@ -468,16 +589,11 @@ class InMemoryGraphRepository(GraphRepository):
         created_nodes = 0
         created_edges = 0
         async with self._lock:
-            # A new document replaces the previous graph: only the newest upload is
-            # kept on the canvas, so the previous file's nodes never linger.
-            if source_doc and source_doc != self._active_document:
-                self._nodes.clear()
-                self._edges.clear()
-                self._communities.clear()
-                self._documents.clear()
-                self._active_document = source_doc
+            # Accumulate mode: keep the existing graph and merge this document into
+            # it. The pipeline clears first only when GRAPH_ACCUMULATE=false.
             if source_doc:
                 self._documents.add(source_doc)
+                self._active_document = source_doc
             for raw in entities:
                 node_id = raw.get("id") or slugify(raw.get("name", ""))
                 existing = self._nodes.get(node_id)
@@ -492,29 +608,56 @@ class InMemoryGraphRepository(GraphRepository):
                         aliases=list(raw.get("aliases") or []),
                         year=raw.get("year") or year_of(raw.get("date")),
                         documents=[source_doc] if source_doc else [],
+                        evidence=[],
+                    )
+                    merge_evidence(
+                        self._nodes[node_id].evidence,
+                        raw.get("evidence"),
+                        source_doc=source_doc,
                     )
                     created_nodes += 1
                 else:
                     existing.mention_count += int(raw.get("mention_count", 1))
-                    description = raw.get("description") or ""
-                    if len(description) > len(existing.description):
-                        existing.description = description
+                    existing.type = merge_type(existing.type, raw.get("type"))
+                    existing.description = merge_description(
+                        existing.description, raw.get("description")
+                    )
                     if source_doc and source_doc not in existing.documents:
                         existing.documents.append(source_doc)
+                    for alias in raw.get("aliases") or []:
+                        if alias and alias not in existing.aliases and alias != existing.name:
+                            existing.aliases.append(alias)
+                    merge_evidence(
+                        existing.evidence,
+                        raw.get("evidence"),
+                        source_doc=source_doc,
+                    )
 
             for raw in relationships:
                 source = raw.get("source")
                 target = raw.get("target")
                 if source not in self._nodes or target not in self._nodes:
                     continue
-                edge_id = raw.get("id") or (
-                    f"{source}__{raw.get('type', 'RELATED_TO')}__{target}".lower()
-                )
+                edge_id = canonical_edge_id(source, target, raw.get("type"))
                 if edge_id in self._edges:
                     edge = self._edges[edge_id]
                     edge.strength = max(edge.strength, int(raw.get("strength", 5)))
-                    if raw.get("description"):
-                        edge.description = raw["description"]
+                    new_desc = str(raw.get("description") or "").strip()
+                    if new_desc:
+                        if not edge.description or len(new_desc) > len(edge.description):
+                            edge.description = new_desc
+                        elif new_desc not in edge.description:
+                            edge.description = f"{edge.description} {new_desc}".strip()
+                    if raw.get("sentiment") and raw.get("sentiment") != "NEUTRAL":
+                        edge.sentiment = raw["sentiment"]
+                    if source_doc and source_doc not in edge.documents:
+                        edge.documents.append(source_doc)
+                    merge_evidence(
+                        edge.evidence,
+                        raw.get("evidence"),
+                        source_doc=source_doc,
+                        chunk_id=raw.get("source_chunk_id"),
+                    )
                     continue
                 self._edges[edge_id] = GraphEdge(
                     id=edge_id,
@@ -523,6 +666,7 @@ class InMemoryGraphRepository(GraphRepository):
                     type=(raw.get("type") or "RELATED_TO").upper(),
                     description=raw.get("description", ""),
                     strength=int(raw.get("strength", 5)),
+                    sentiment=raw.get("sentiment", "NEUTRAL"),
                     date=raw.get("date"),
                     date_confidence=raw.get("date_confidence", "unknown"),
                     source_doc=raw.get("source_doc") or source_doc,
@@ -530,6 +674,14 @@ class InMemoryGraphRepository(GraphRepository):
                     source_page=raw.get("source_page") or source_page,
                     status=raw.get("status", "ACTIVE"),
                     year=raw.get("year") or year_of(raw.get("date")),
+                    documents=[source_doc] if source_doc else [],
+                    evidence=[],
+                )
+                merge_evidence(
+                    self._edges[edge_id].evidence,
+                    raw.get("evidence"),
+                    source_doc=source_doc,
+                    chunk_id=raw.get("source_chunk_id"),
                 )
                 created_edges += 1
 
@@ -651,6 +803,10 @@ class Neo4jGraphRepository(GraphRepository):
         rows = await self._read("MATCH (n:Entity) RETURN count(n) AS count")
         return int(rows[0]["count"]) if rows else 0
 
+    async def reset_for_document(self, source_doc: str) -> None:
+        """Replace mode: drop the previous document's graph before indexing."""
+        await self._write("MATCH (n:Entity) DETACH DELETE n")
+
     async def close(self) -> None:
         if self._driver:
             await self._driver.close()
@@ -679,6 +835,8 @@ class Neo4jGraphRepository(GraphRepository):
             degree=int(props.get("degree", 0) or 0),
             year=int(props["year"]) if props.get("year") else None,
             aliases=list(props.get("aliases") or []),
+            documents=list(props.get("documents") or []),
+            evidence=decode_evidence(props.get("evidence")),
         )
 
     @staticmethod
@@ -690,6 +848,7 @@ class Neo4jGraphRepository(GraphRepository):
             type=props.get("type", "RELATED_TO"),
             description=props.get("description", ""),
             strength=int(props.get("strength", 5) or 5),
+            sentiment=props.get("sentiment", "NEUTRAL"),
             date=props.get("date"),
             date_confidence=props.get("dateConfidence", "unknown"),
             source_doc=props.get("sourceDoc"),
@@ -697,6 +856,8 @@ class Neo4jGraphRepository(GraphRepository):
             source_page=props.get("sourcePage"),
             status=props.get("status", "ACTIVE"),
             year=year_of(props.get("date")),
+            documents=list(props.get("documents") or []),
+            evidence=decode_evidence(props.get("evidence")),
         )
 
     async def get_viewport(self, limit: int | None = None) -> GraphViewport:
@@ -852,6 +1013,9 @@ class Neo4jGraphRepository(GraphRepository):
                 "communityId": int(entity.get("community_id", 0)),
                 "year": entity.get("year") or year_of(entity.get("date")),
                 "aliases": list(entity.get("aliases") or []),
+                "mentionCount": int(entity.get("mention_count", 1) or 1),
+                "documents": [source_doc] if source_doc else [],
+                "evidence": encode_evidence(entity.get("evidence")),
             }
             for entity in entities
         ]
@@ -862,34 +1026,50 @@ class Neo4jGraphRepository(GraphRepository):
                 "MERGE (e:Entity {id: row.id}) "
                 "ON CREATE SET e.name = row.name, e.type = row.type, e.description = row.description, "
                 "  e.community_id = row.communityId, e.year = row.year, e.aliases = row.aliases, "
-                "  e.mentionCount = 1, e.createdAt = datetime() "
-                "ON MATCH SET e.mentionCount = coalesce(e.mentionCount, 1) + 1, "
+                "  e.mentionCount = row.mentionCount, e.documents = row.documents, "
+                "  e.evidence = row.evidence, e.createdAt = datetime() "
+                "ON MATCH SET e.mentionCount = coalesce(e.mentionCount, 1) + row.mentionCount, "
                 "  e.description = CASE WHEN size(coalesce(row.description, '')) > "
-                "    size(coalesce(e.description, '')) THEN row.description ELSE e.description END "
+                "    size(coalesce(e.description, '')) THEN row.description ELSE e.description END, "
+                "  e.aliases = coalesce(e.aliases, []) + "
+                "    [a IN row.aliases WHERE NOT a IN coalesce(e.aliases, [])], "
+                "  e.documents = coalesce(e.documents, []) + "
+                "    [d IN row.documents WHERE NOT d IN coalesce(e.documents, [])], "
+                "  e.evidence = coalesce(e.evidence, []) + "
+                "    [x IN row.evidence WHERE NOT x IN coalesce(e.evidence, [])] "
                 "RETURN count(e) AS count",
                 rows=rows,
             )
             node_count = int(result[0]["count"]) if result else 0
 
-        rel_rows = [
-            {
-                "id": rel.get("id")
-                or f"{rel['source']}__{rel.get('type', 'RELATED_TO')}__{rel['target']}".lower(),
-                "sourceId": rel["source"],
-                "targetId": rel["target"],
-                "type": (rel.get("type") or "RELATED_TO").upper(),
-                "description": rel.get("description", ""),
-                "strength": int(rel.get("strength", 5)),
-                "date": rel.get("date"),
-                "dateConfidence": rel.get("date_confidence", "unknown"),
-                "sourceChunkId": rel.get("source_chunk_id") or source_chunk_id,
-                "sourceDoc": rel.get("source_doc") or source_doc,
-                "sourcePage": rel.get("source_page") or source_page,
-                "status": rel.get("status", "ACTIVE"),
-            }
-            for rel in relationships
-            if rel.get("source") and rel.get("target")
-        ]
+        rel_rows: list[dict[str, Any]] = []
+        for rel in relationships:
+            source_id = rel.get("source")
+            target_id = rel.get("target")
+            if not source_id or not target_id:
+                continue
+            relation_type = (rel.get("type") or "RELATED_TO").upper()
+            # Symmetric relationships share one direction so A→B and B→A merge.
+            if relation_type in SYMMETRIC_RELATIONS and source_id > target_id:
+                source_id, target_id = target_id, source_id
+            rel_rows.append(
+                {
+                    "id": canonical_edge_id(source_id, target_id, relation_type),
+                    "sourceId": source_id,
+                    "targetId": target_id,
+                    "type": relation_type,
+                    "description": rel.get("description", ""),
+                    "strength": int(rel.get("strength", 5)),
+                    "date": rel.get("date"),
+                    "dateConfidence": rel.get("date_confidence", "unknown"),
+                    "sourceChunkId": rel.get("source_chunk_id") or source_chunk_id,
+                    "sourceDoc": rel.get("source_doc") or source_doc,
+                    "sourcePage": rel.get("source_page") or source_page,
+                    "status": rel.get("status", "ACTIVE"),
+                    "documents": [source_doc] if source_doc else [],
+                    "evidence": encode_evidence(rel.get("evidence")),
+                }
+            )
         rel_count = 0
         if rel_rows:
             result = await self._write(
@@ -900,10 +1080,18 @@ class Neo4jGraphRepository(GraphRepository):
                 "ON CREATE SET r.id = rel.id, r.description = rel.description, "
                 "  r.strength = rel.strength, r.date = rel.date, r.dateConfidence = rel.dateConfidence, "
                 "  r.sourceChunkId = rel.sourceChunkId, r.sourceDoc = rel.sourceDoc, "
-                "  r.sourcePage = rel.sourcePage, r.status = rel.status, r.createdAt = datetime() "
-                "ON MATCH SET r.strength = CASE WHEN rel.strength > coalesce(r.strength, 0) "
-                "  THEN rel.strength ELSE r.strength END, "
-                "  r.sourcePage = coalesce(r.sourcePage, rel.sourcePage) "
+                "  r.sourcePage = rel.sourcePage, r.status = rel.status, "
+                "  r.documents = rel.documents, r.evidence = rel.evidence, r.createdAt = datetime() "
+                "ON MATCH SET r.id = coalesce(r.id, rel.id), "
+                "  r.strength = CASE WHEN rel.strength > coalesce(r.strength, 0) "
+                "    THEN rel.strength ELSE r.strength END, "
+                "  r.description = CASE WHEN size(coalesce(rel.description, '')) > "
+                "    size(coalesce(r.description, '')) THEN rel.description ELSE r.description END, "
+                "  r.sourcePage = coalesce(r.sourcePage, rel.sourcePage), "
+                "  r.documents = coalesce(r.documents, []) + "
+                "    [d IN rel.documents WHERE NOT d IN coalesce(r.documents, [])], "
+                "  r.evidence = coalesce(r.evidence, []) + "
+                "    [x IN rel.evidence WHERE NOT x IN coalesce(r.evidence, [])] "
                 "RETURN count(r) AS count",
                 rows=rel_rows,
             )

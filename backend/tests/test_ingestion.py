@@ -46,11 +46,14 @@ def test_upload_txt_adds_nodes_and_reports_delta(client: TestClient):
     assert job["status"] == "COMPLETED", job.get("error_message")
     assert job["nodes_added"] >= 1
     assert job["edges_added"] >= 1
+    assert job["graph_mode"] == "accumulate"
 
     after = client.get("/api/v1/graph/viewport").json()
-    # The upload replaces the seed graph, so the canvas holds only this document.
-    assert after["stats"]["node_count"] == job["nodes_added"]
-    assert after["stats"]["document_count"] == 1
+    # Accumulate mode merges the upload into the existing graph, so the canvas
+    # keeps the seed and every previously ingested document.
+    assert after["stats"]["node_count"] >= job["nodes_added"]
+    assert after["stats"]["document_count"] >= 1
+    assert "Zephyr" in after["documents"]
     assert any(node["name"] == "Zephyr Quantum" for node in after["nodes"])
 
 
@@ -63,8 +66,8 @@ def test_upload_rejects_unsupported_type(client: TestClient):
     assert "Unsupported file type" in response.json()["detail"]
 
 
-def test_second_upload_replaces_previous_document(client: TestClient):
-    """A new document must wipe the previous graph, never extend it."""
+def test_second_upload_accumulates_previous_document(client: TestClient):
+    """A new document must extend the graph, never wipe the previous one."""
     documents = {
         "onyx.txt": (
             "Onyx Aerospace acquired Tidal Systems in 2025. "
@@ -87,29 +90,34 @@ def test_second_upload_replaces_previous_document(client: TestClient):
         job = _wait_for_completion(client, response.json()["job_id"])
         assert job["status"] == "COMPLETED", job.get("error_message")
         assert job["nodes_added"] >= 2
+        assert job["graph_mode"] == "accumulate"
 
     after = client.get("/api/v1/graph/viewport").json()
     names = {node["name"] for node in after["nodes"]}
 
-    # Only the newest document's graph remains; the previous file is gone.
+    # Both documents remain: accumulation is the point of a self-evolving graph.
     assert "Verdant Bio" in names
     assert "Helix Foundry" in names
-    assert "Onyx Aerospace" not in names
-    assert "Tidal Systems" not in names
+    assert "Onyx Aerospace" in names
+    assert "Tidal Systems" in names
 
-    assert after["stats"]["document_count"] == 1
-    assert after["documents"] == ["Verdant"]
-    assert all(node["documents"] == ["Verdant"] for node in after["nodes"])
+    assert after["stats"]["document_count"] >= 2
+    assert {"Verdant", "Onyx"} <= set(after["documents"])
+    onyx = next(node for node in after["nodes"] if node["name"] == "Onyx Aerospace")
+    verdant = next(node for node in after["nodes"] if node["name"] == "Verdant Bio")
+    assert "Onyx" in onyx["documents"]
+    assert "Verdant" in verdant["documents"]
 
 
 def test_document_without_new_relationships_is_still_counted(tmp_path: Path):
-    """A document that only repeats entities still replaces the graph and counts as one doc."""
+    """A document that only adds a source count still appears in the document total."""
     snapshot = tmp_path / "graph.json"
 
-    async def scenario() -> tuple[int, int, int]:
+    async def scenario() -> tuple[int, int, int, int]:
         repository = InMemoryGraphRepository(seed=True, persist=True, snapshot_path=snapshot)
         await repository.initialize()
-        before = (await repository.stats()).document_count
+        before_stats = await repository.stats()
+        before = before_stats.document_count
         await repository.upsert_graph(
             [],
             [],
@@ -122,12 +130,12 @@ def test_document_without_new_relationships_is_still_counted(tmp_path: Path):
         reloaded = InMemoryGraphRepository(seed=True, persist=True, snapshot_path=snapshot)
         await reloaded.initialize()
         assert (await reloaded.stats()).document_count == after
-        return before, after, stats.node_count
+        return before, after, before_stats.node_count, stats.node_count
 
-    before, after, node_count = asyncio.run(scenario())
+    before, after, before_nodes, after_nodes = asyncio.run(scenario())
     assert before > 1
-    assert after == 1
-    assert node_count == 0
+    assert after == before + 1
+    assert after_nodes == before_nodes
 
 
 def test_in_memory_snapshot_survives_restart(tmp_path: Path):
@@ -158,5 +166,5 @@ def test_in_memory_snapshot_survives_restart(tmp_path: Path):
 
     count, name = asyncio.run(scenario())
     assert name == "Aurora Labs"
-    # The replacement snapshot holds only the uploaded document's graph.
-    assert count == 1
+    # Accumulate mode keeps the seed graph and merges the uploaded document in.
+    assert count >= 2

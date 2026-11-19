@@ -10,6 +10,10 @@ export const ENTITY_COLORS: Record<EntityType, string> = {
   LOCATION: "#06B6D4",
   EVENT: "#EC4899",
   ORGANIZATION: "#6366F1",
+  CHARACTER: "#FB7185",
+  FACTION: "#8B5CF6",
+  CONCEPT: "#14B8A6",
+  ARTIFACT: "#F59E0B",
 };
 
 export const ENTITY_LABELS: Record<EntityType, string> = {
@@ -21,6 +25,10 @@ export const ENTITY_LABELS: Record<EntityType, string> = {
   LOCATION: "Location",
   EVENT: "Event",
   ORGANIZATION: "Organization",
+  CHARACTER: "Character",
+  FACTION: "Faction",
+  CONCEPT: "Concept",
+  ARTIFACT: "Artifact",
 };
 
 export const COMMUNITY_PALETTE = [

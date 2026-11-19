@@ -20,7 +20,7 @@ from typing import Any
 
 from app.config import settings
 from app.core import llm
-from app.graph.repository import slugify
+from app.graph.repository import merge_type, slugify
 from app.ingestion.extractor import ExtractionReport
 from app.schemas.graph import GraphNode
 
@@ -67,8 +67,43 @@ TYPE_ALIASES: dict[str, str] = {
     "MODEL": "TECHNOLOGY",
 }
 
+KNOWN_ALIASES: dict[str, str] = {
+    "tsucchi": "Keita Amano",
+    "mono": "Chiaki Hoshinomori",
+    "nobe pro": "Konoha Hoshinomori",
+    "nobe-pro": "Konoha Hoshinomori",
+    "chiaki nobe-ge indie": "Chiaki Hoshinomori",
+    "chiaki nobe ge indie": "Chiaki Hoshinomori",
+    "nobe-ge indie": "Chiaki Hoshinomori",
+    "nobe ge indie": "Chiaki Hoshinomori",
+    "gamers rehab alliance": "Gamers Rehabilitation Alliance",
+}
+
 FUZZY_THRESHOLD = 88.0
 COSINE_THRESHOLD = 0.92
+
+# When the same name is extracted with different types, the LLM is inconsistent
+# rather than describing two entities. Pick the type with the most votes; ties
+# fall back to this specificity order.
+TYPE_PRIORITY: dict[str, int] = {
+    name: index
+    for index, name in enumerate(
+        [
+            "PERSON",
+            "ORGANIZATION",
+            "COMPANY",
+            "LOCATION",
+            "EVENT",
+            "PRODUCT",
+            "TECHNOLOGY",
+            "REGULATION",
+            "FACTION",
+            "ARTIFACT",
+            "CONCEPT",
+            "CHARACTER",
+        ]
+    )
+}
 
 
 @dataclass(slots=True)
@@ -100,16 +135,21 @@ def normalize_type(value: str) -> str:
 class EntityResolver:
     def __init__(self, existing_nodes: list[GraphNode]) -> None:
         self._by_normalized: dict[tuple[str, str], GraphNode] = {}
+        self._by_name: dict[str, GraphNode] = {}
         self._by_id: dict[str, GraphNode] = {}
         self._used_ids: set[str] = set()
-        self._used_normalized: set[tuple[str, str]] = set()
+        self._used_normalized: set[str] = set()
         for node in existing_nodes:
             self._by_id[node.id] = node
             self._used_ids.add(node.id)
             for candidate in [node.name, *node.aliases]:
-                key = (normalize_name(candidate), normalize_type(node.type))
+                normalized = normalize_name(candidate)
+                if not normalized:
+                    continue
+                key = (normalized, normalize_type(node.type))
                 self._by_normalized.setdefault(key, node)
-                self._used_normalized.add(key)
+                self._by_name.setdefault(normalized, node)
+                self._used_normalized.add(normalized)
 
     async def resolve(self, report: ExtractionReport) -> ResolvedGraph:
         graph = ResolvedGraph()
@@ -118,39 +158,73 @@ class EntityResolver:
         for result in report.results:
             chunk = result.chunk
             for entity in result.extraction.entities:
-                normalized = normalize_name(entity.name)
-                entity_type = normalize_type(entity.type)
+                raw_name = entity.name.strip()
+                normalized = normalize_name(raw_name)
+                canonical_override = KNOWN_ALIASES.get(normalized)
+                if canonical_override:
+                    alias_name = raw_name
+                    display_name = canonical_override
+                    normalized = normalize_name(canonical_override)
+                    from app.ingestion.extractor import KNOWN_TYPES
+                    canon_type = KNOWN_TYPES.get(normalized)
+                    entity_type = normalize_type(canon_type or entity.type)
+                else:
+                    alias_name = None
+                    display_name = raw_name
+                    entity_type = normalize_type(entity.type)
                 if not normalized:
                     continue
-                bucket_key = f"{normalized}|{entity_type}"
-                bucket = candidates.get(bucket_key)
+                # Bucket by normalized name only: the same entity can arrive with
+                # different type labels from different chunks.
+                bucket = candidates.get(normalized)
                 if bucket is None:
-                    candidates[bucket_key] = {
-                        "name": entity.name.strip(),
+                    candidates[normalized] = {
+                        "name": display_name,
                         "type": entity_type,
+                        "type_votes": {entity_type: 1},
                         "description": entity.description,
                         "mention_count": 1,
-                        "aliases": [],
+                        "aliases": [alias_name] if alias_name and alias_name.lower() != display_name.lower() else [],
                         "chunks": [chunk.id],
                         "page": chunk.page_number,
                     }
                 else:
                     bucket["mention_count"] += 1
+                    bucket["type_votes"][entity_type] = bucket["type_votes"].get(entity_type, 0) + 1
                     bucket["chunks"].append(chunk.id)
+                    if alias_name and alias_name not in bucket["aliases"] and alias_name.lower() != bucket["name"].lower():
+                        bucket["aliases"].append(alias_name)
+                    # Prefer the most complete surface form as the display name.
+                    if display_name.lower() != bucket["name"].lower():
+                        if len(display_name) > len(bucket["name"]):
+                            bucket["aliases"].append(bucket["name"])
+                            bucket["name"] = display_name
+                        elif display_name not in bucket["aliases"]:
+                            bucket["aliases"].append(display_name)
                     if len(entity.description) > len(bucket["description"]):
                         bucket["description"] = entity.description
+
+        for bucket in candidates.values():
+            bucket["type"] = self._pick_type(bucket["type_votes"])
 
         # Tier 1 + 2 resolution against the existing graph.
         unresolved: list[dict[str, Any]] = []
         for bucket in candidates.values():
             normalized = normalize_name(bucket["name"])
             entity_type = bucket["type"]
-            existing = self._by_normalized.get((normalized, entity_type))
+            # Exact name/alias matches merge regardless of type label; only the
+            # fuzzy and embedding tiers stay type-scoped to avoid false merges.
+            existing = self._by_name.get(normalized)
+            if existing is None:
+                existing = self._by_normalized.get((normalized, entity_type))
             if existing is None:
                 existing = self._fuzzy_match(normalized, entity_type, bucket["name"])
             if existing is not None:
                 graph.merged += 1
                 bucket["id"] = existing.id
+                # A specific label replaces a generic fallback, but once a stable
+                # label exists it is not flipped by later documents.
+                bucket["type"] = merge_type(existing.type, bucket["type"])
                 bucket["canonical_name"] = existing.name
                 graph.entities.append(self._resolved_entity(bucket, existing.id, existing.name))
                 self._register_name(graph, bucket["name"], existing.id)
@@ -172,6 +246,8 @@ class EntityResolver:
             self._used_ids.add(entity_id)
             self._register_name(graph, bucket["name"], entity_id)
             self._register_name(graph, canonical_name, entity_id)
+            for alias in bucket.get("aliases", []):
+                self._register_name(graph, alias, entity_id)
 
         graph.relationships = self._rewire_relationships(report, graph)
         logger.info(
@@ -244,16 +320,23 @@ class EntityResolver:
         names.sort(key=lambda value: (len(value.split()), len(value)), reverse=True)
         return names[0].strip()
 
+    @staticmethod
+    def _pick_type(type_votes: dict[str, int]) -> str:
+        """Majority type, with a specificity tie-break for inconsistent labels."""
+        return sorted(
+            type_votes.items(),
+            key=lambda item: (-item[1], TYPE_PRIORITY.get(item[0], 99)),
+        )[0][0]
+
     def _allocate_id(self, name: str, bucket: dict[str, Any]) -> str:
         base = slugify(name)
         candidate = base
         suffix = 2
-        key = (normalize_name(name), bucket["type"])
+        key = normalize_name(name)
         while candidate in self._used_ids or key in self._used_normalized:
             candidate = f"{base}_{suffix}"
             suffix += 1
-        # If the candidate was free, reserve the normalized key.
-        self._used_normalized.add((normalize_name(name), bucket["type"]))
+        self._used_normalized.add(key)
         return candidate
 
     def _resolved_entity(
@@ -302,6 +385,7 @@ class EntityResolver:
                         "type": rel_type,
                         "description": relationship.description,
                         "strength": int(relationship.strength),
+                        "sentiment": getattr(relationship, "sentiment", "NEUTRAL"),
                         "date": _normalize_date(relationship.date),
                         "date_confidence": relationship.date_confidence,
                         "source_doc": chunk.doc_title,
@@ -311,6 +395,8 @@ class EntityResolver:
                     }
                 else:
                     existing["strength"] = max(existing["strength"], int(relationship.strength))
+                    if getattr(relationship, "sentiment", None) and relationship.sentiment != "NEUTRAL":
+                        existing["sentiment"] = relationship.sentiment
                     if len(relationship.description) > len(existing["description"]):
                         existing["description"] = relationship.description
         return list(merged.values())

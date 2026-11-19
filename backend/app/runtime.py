@@ -92,6 +92,11 @@ async def runtime_health() -> dict[str, Any]:
         "environment": settings.environment,
         "demo_mode": settings.demo_mode,
         "llm_enabled": settings.llm_enabled,
+        "llm_providers": [
+            name for name in settings.llm_providers if settings.provider_enabled(name)
+        ],
+        "pdf_parser": settings.pdf_parser,
+        "graph_accumulate": settings.graph_accumulate,
         "celery_enabled": settings.use_celery,
         "graph": graph,
         "postgres": postgres if isinstance(postgres, dict) else {"status": "error"},

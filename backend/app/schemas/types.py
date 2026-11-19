@@ -11,6 +11,10 @@ EntityType = Literal[
     "REGULATION",
     "EVENT",
     "ORGANIZATION",
+    "CHARACTER",
+    "FACTION",
+    "CONCEPT",
+    "ARTIFACT",
 ]
 
 EdgeStatus = Literal["ACTIVE", "NEW", "DISSOLVED"]

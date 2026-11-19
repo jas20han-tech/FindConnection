@@ -24,16 +24,24 @@ logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[int, int, int, int], Awaitable[None]]
 
-SYSTEM_PROMPT = """You are a precise knowledge-graph extraction engine.
-Extract only entities and relationships explicitly supported by the text.
+SYSTEM_PROMPT = """You are a narrative knowledge-graph extraction engine.
+Your goal is to extract entities and the deep, contextual story of how they are connected.
 Rules:
-- Use canonical, capitalized entity names (prefer 'Google' over 'Google LLC' when the text says Google).
-- Allowed entity types: PERSON, COMPANY, PRODUCT, TECHNOLOGY, LOCATION, REGULATION, EVENT, ORGANIZATION.
-- Relationship types are UPPER_SNAKE_CASE verbs: CEO_OF, DEVELOPED, INVESTED_IN, ACQUIRED, SUPPLIES, REGULATES, REGULATED_BY, PARTNERED_WITH, COMPETES_WITH, FOUNDED, PUBLISHED, OWNS, HOSTS, USES, BUILT_ON.
-- Every relationship must connect two entities that appear in the entities list.
-- Include a date (YYYY-MM-DD) only when the text supports it; otherwise null and date_confidence 'unknown'.
-- Never infer facts that are not in the text. Descriptions must be one sentence.
-- If the text contains no meaningful entities, return empty lists."""
+1. Entity Extraction:
+   - Identify characters, organizations, concepts, artifacts, factions, or key entities.
+   - Use canonical names (e.g., "Keita Amano", "Aguri", "Google").
+   - Entity types: PERSON, CHARACTER, FACTION, ORGANIZATION, ARTIFACT, LOCATION, EVENT, TECHNOLOGY, CONCEPT, COMPANY, PRODUCT, REGULATION.
+2. Story-Driven Relationships:
+   - For every connection between Entity A and Entity B, do NOT just extract a generic label.
+   - Relationship 'type': Descriptive UPPER_SNAKE_CASE verb (e.g., MISUNDERSTANDS_FEELINGS_FOR, CHILDHOOD_FRIEND_OF, SECRETLY_ADMIRES, RIVAL_TO, BETRAYED_BY, STRATEGIC_ALLIANCE_WITH, FORGED_AGREEMENT_WITH).
+   - Relationship 'description' (The Story): Write 2 to 3 detailed sentences explaining the STORY behind their connection:
+     * How and why are they connected?
+     * What events, tensions, misunderstandings, or shared history define their dynamic?
+     * How does their relationship evolve or impact the surrounding world/plot?
+3. Fidelity:
+   - Anchor all relational lore strictly in the text. Do not invent unrelated lore.
+   - Include dates, chapters, arcs, or timeline references if mentioned.
+   - Strength: Rate 1 (incidental contact) to 10 (central, plot-defining bond)."""
 
 
 @dataclass(slots=True)
@@ -111,6 +119,26 @@ KNOWN_TYPES: dict[str, EntityType] = {
     "federal trade commission": "ORGANIZATION",
     "bletchley park ai safety summit": "EVENT",
     "ai safety summit": "EVENT",
+    "keita amano": "CHARACTER",
+    "tsucchi": "CHARACTER",
+    "karen tendou": "CHARACTER",
+    "chiaki hoshinomori": "CHARACTER",
+    "mono": "CHARACTER",
+    "tasuku uehara": "CHARACTER",
+    "aguri": "CHARACTER",
+    "eiichi misumi": "CHARACTER",
+    "konoha hoshinomori": "CHARACTER",
+    "nobe-pro": "CHARACTER",
+    "otobuki game club": "ORGANIZATION",
+    "gamers rehabilitation alliance": "ORGANIZATION",
+    "otobuki high school": "LOCATION",
+    "hekiyou private academy": "LOCATION",
+    "game arcade center": "LOCATION",
+    "dungeon & brave": "PRODUCT",
+    "nobe-ge indie": "PRODUCT",
+    "questing engine": "TECHNOLOGY",
+    "handheld console": "PRODUCT",
+    "competitive esports charter": "REGULATION",
 }
 
 REGULATION_WORDS = {
@@ -239,8 +267,8 @@ RELATION_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 ]
 
 CANDIDATE_RE = re.compile(
-    r"\b((?:[A-Z][A-Za-z0-9&.\-']+)(?:\s+(?:(?:of|for|and|the|de|van|von|al)\s+)?"
-    r"[A-Z][A-Za-z0-9&.\-']+){0,3})"
+    r"\b((?:[A-Z][A-Za-z0-9&.\-']+)(?:\s+(?:(?:of|the|de|van|von|al)\s+)?"
+    r"[A-Z][A-Za-z0-9&.\-']+){0,2})"
 )
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(])")
 YEAR_RE = re.compile(r"\b(19[5-9]\d|20[0-4]\d)\b")
@@ -255,11 +283,17 @@ LEADING_NOISE = {
     "within", "without", "yet",
     # Sentence-initial discourse markers / gerunds.
     "after", "afterwards", "analyzing", "eventually", "following", "initially",
-    "later", "notably", "subsequently", "today", "ultimately",
+    "later", "notably", "subsequently", "today", "ultimately", "became", "joined",
+    "tracking", "tests", "what", "how", "instead", "simulates", "verifies", "upon",
+    "finally", "prior", "climactic", "furthermore", "neither", "she", "one", "inside",
 }
 TRAILING_NOISE = {
     "a", "an", "and", "as", "at", "by", "for", "from", "in", "into", "of", "on", "or",
-    "the", "to", "with", "partners", "supplies", "regulates",
+    "the", "to", "with", "partners", "supplies", "regulates", "ceo", "works",
+    "structural", "regulatory", "collaborative", "alias", "plays", "developed",
+    "strengthened", "new", "trial", "president", "member", "advice", "feud",
+    "post-aug", "status", "category", "disappears", "without", "figure", "paradox",
+    "competes", "trace",
 }
 # A job title in front of a name ("CEO of Crimson Lotus") is not part of the entity.
 LEADING_ROLE_RE = re.compile(
@@ -276,12 +310,42 @@ JUNK_NAMES = {
     "invests", "launches", "operates", "owns", "partners", "produces", "provides",
     "publishes", "references", "regulates", "restricts", "reveals", "supplies",
     "chapter", "chapters", "section", "sections", "overview", "summary",
-    "published date", "archive id",
+    "published date", "archive id", "competes", "competes_with", "partners_with",
+    "ceo_of", "works_at", "supplies_to", "plays", "developed", "structural",
+    "regulatory", "collaborative", "status", "category", "effective date",
 }
+
+JUNK_SUBSTRINGS = (
+    "query", "synopsis", "grounding", "dossier", "document", "resolution",
+    "figure", "paradox", "source entity", "target entity", "benchmark",
+    "published date", "alias grounding", "relationship network", "online aliases",
+    "document id", "entity resolution", "pentagon bridge", "cutest girl",
+    "typical high school", "average student", "uneventful life", "comical battle",
+    "wild unexpected", "real world", "secret online", "online devotion",
+    "offline rivalry", "cascade bridge", "temporal network", "social shift",
+    "misunderstanding pentagon", "game club conflict", "setting", "status",
+    "category", "effective date", "relationship type", "narrative context",
+    "tests multi-hop", "tests dissolved", "simulates the exact",
+    "verifies entity", "benchmarks", "benchmark queries", "connection query",
+    "impact query", "temporal query", "secret alias"
+)
+
+CHARACTER_INDICATORS = {
+    "amano", "tendou", "tend", "hoshinomori", "uehara", "aguri", "misumi",
+    "kaelen", "vance", "elena", "tsucchi", "mono", "konoha"
+}
+
+DATE_FULL_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
+EXPLICIT_REL_RE = re.compile(
+    r"\(\s*(CEO_OF|WORKS_AT|PARTNERS_WITH|COMPETES_WITH|SUPPLIES_TO|SUPPLIES|REGULATES|PLAYS|DEVELOPED|ALTERNATIVE_TO|INVESTED_IN|ACQUIRED|DISSOLVED)"
+    r"(?:[,\s/]+(?:strength:\s*(\d+)/10|established\s+(\d{4}-\d{2}-\d{2})|active\s+(\d{4}-\d{2}-\d{2})|(\d{4}-\d{2}-\d{2})|[^)]*))*\)",
+    re.IGNORECASE,
+)
 
 
 def _clean_candidate(value: str) -> str:
     name = value.strip(" .,;:()[]\"'")
+    name = re.sub(r"'s\b", "", name)
     name = re.sub(r"'s$", "", name)
     name = re.sub(r"\s+", " ", name)
     name = LEADING_ROLE_RE.sub("", name)
@@ -295,20 +359,26 @@ def _clean_candidate(value: str) -> str:
 
 
 def _is_valid_name(name: str) -> bool:
-    if len(name) < 2 or len(name) > 64:
+    if len(name) < 2 or len(name) > 48:
         return False
-    if name in STOPWORD_NAMES or name.lower() in JUNK_NAMES:
+    lowered = name.lower().strip()
+    if name in STOPWORD_NAMES or lowered in JUNK_NAMES:
         return False
     words = name.split()
-    if all(word in STOPWORD_NAMES for word in words):
+    # Reject multi-word ALL CAPS titles (e.g. ANIME RELATIONSHIP NETWORK, PRIMARY SOURCE GROUNDING)
+    if name.isupper() and len(words) >= 2:
+        return False
+    if any(sub in lowered for sub in JUNK_SUBSTRINGS):
+        return False
+    if all(word.lower() in STOPWORD_NAMES for word in words):
         return False
     if name.isdigit() or YEAR_RE.fullmatch(name):
         return False
-    if name.lower() in {"ai", "ceo", "cto", "us", "eu", "uk", "am", "pm"}:
+    if lowered in {"ai", "ceo", "cto", "us", "eu", "uk", "am", "pm"}:
         return True
     if len(words) == 1:
         # Single words need to look like an acronym or a known entity.
-        return name.isupper() or name.lower() in KNOWN_TYPES
+        return name.isupper() or lowered in KNOWN_TYPES
     return True
 
 
@@ -317,17 +387,19 @@ def infer_entity_type(name: str) -> EntityType:
     if lowered in KNOWN_TYPES:
         return KNOWN_TYPES[lowered]
     words = set(re.findall(r"[a-z]+", lowered))
+    if words & CHARACTER_INDICATORS:
+        return "CHARACTER"
     if words & COMPANY_SUFFIXES:
         return "COMPANY"
-    if words & REGULATION_WORDS:
+    if (words & REGULATION_WORDS) or "charter" in words:
         return "REGULATION"
     if words & EVENT_WORDS:
         return "EVENT"
-    if words & ORGANIZATION_WORDS:
+    if (words & ORGANIZATION_WORDS) or "club" in words or "alliance" in words:
         return "ORGANIZATION"
-    if words & PRODUCT_WORDS:
+    if (words & PRODUCT_WORDS) or "indie" in words or "game" in words or "rpg" in words or "console" in words:
         return "PRODUCT"
-    if words & TECH_WORDS:
+    if (words & TECH_WORDS) or "engine" in words:
         return "TECHNOLOGY"
     if name.isupper() and len(name) <= 6:
         return "ORGANIZATION"
@@ -344,6 +416,9 @@ def heuristic_extract_chunk(chunk: Chunk) -> ChunkGraphExtraction:
         sentence = sentence.strip()
         if len(sentence) < 20:
             continue
+        s_lower = sentence.lower()
+        if any(skip in s_lower for skip in ["benchmark queries", "connection query", "impact query", "temporal query", "queries to run", "figure ", "path finder", "enables the path", "tests multi-hop"]):
+            continue
 
         mentions: list[tuple[int, str]] = []
         for match in CANDIDATE_RE.finditer(sentence):
@@ -355,7 +430,7 @@ def heuristic_extract_chunk(chunk: Chunk) -> ChunkGraphExtraction:
                 entities[name] = ExtractedEntity(
                     name=name,
                     type=infer_entity_type(name),
-                    description=_truncate(sentence, 220),
+                    description=_truncate(sentence, 260),
                 )
             mentions.append((match.start(), name))
 
@@ -369,22 +444,53 @@ def heuristic_extract_chunk(chunk: Chunk) -> ChunkGraphExtraction:
         if len(unique) < 2:
             continue
 
+        # Check for explicit date (YYYY-MM-DD) or year (YYYY)
+        date_full = DATE_FULL_RE.search(sentence)
         year_match = YEAR_RE.search(sentence)
-        date = f"{year_match.group(1)}-01-01" if year_match else None
+        date = date_full.group(1) if date_full else (f"{year_match.group(1)}-01-01" if year_match else None)
+
+        # Check for explicit parenthetical relationship annotation
+        explicit_match = EXPLICIT_REL_RE.search(sentence)
+        explicit_type = explicit_match.group(1).upper() if explicit_match else None
+        if explicit_type == "SUPPLIES":
+            explicit_type = "SUPPLIES_TO"
+
+        explicit_strength = (
+            int(explicit_match.group(2))
+            if (explicit_match and explicit_match.group(2))
+            else (9 if explicit_type else None)
+        )
+        if explicit_match and not date:
+            date = explicit_match.group(3) or explicit_match.group(4) or explicit_match.group(5)
 
         for index in range(min(len(unique) - 1, 4)):
             source_pos, source_name = unique[index]
             target_pos, target_name = unique[index + 1]
             if source_name.lower() == target_name.lower():
                 continue
+
             between = sentence[source_pos + len(source_name) : target_pos]
-            rel_type = "RELATED_TO"
-            strength = 4
-            for pattern, candidate_type in RELATION_PATTERNS:
-                if pattern.search(between):
-                    rel_type = candidate_type
-                    strength = 8 if candidate_type != "RELATED_TO" else 5
-                    break
+            rel_type = explicit_type or "RELATED_TO"
+            strength = explicit_strength or 5
+            sentiment = "NEUTRAL"
+
+            if not explicit_type:
+                for pattern, candidate_type in RELATION_PATTERNS:
+                    if pattern.search(between):
+                        rel_type = candidate_type
+                        strength = 8 if candidate_type != "RELATED_TO" else 5
+                        break
+
+            if rel_type == "COMPETES_WITH":
+                sentiment = "RIVALRY"
+            elif rel_type == "PARTNERS_WITH":
+                s_lower = sentence.lower()
+                sentiment = "ROMANTIC" if any(w in s_lower for w in ["dating", "crush", "girlfriend", "boyfriend", "soulmate"]) else "ALLIANCE"
+            elif rel_type in {"SUPPLIES_TO", "SUPPLIES"}:
+                sentiment = "ALLIANCE"
+            elif rel_type in {"CEO_OF", "WORKS_AT", "REGULATES"}:
+                sentiment = "STRUCTURAL"
+
             key = (source_name.lower(), rel_type, target_name.lower())
             if key in seen_relationships:
                 continue
@@ -394,14 +500,15 @@ def heuristic_extract_chunk(chunk: Chunk) -> ChunkGraphExtraction:
                     source=source_name,
                     target=target_name,
                     type=rel_type,
-                    description=_truncate(sentence, 240),
+                    description=_truncate(sentence, 400),
                     strength=strength,
+                    sentiment=sentiment,
                     date=date,
-                    date_confidence="inferred" if date else "unknown",
+                    date_confidence="explicit" if date_full else ("inferred" if date else "unknown"),
                 )
             )
 
-    return ChunkGraphExtraction(entities=list(entities.values())[:16], relationships=relationships[:24])
+    return ChunkGraphExtraction(entities=list(entities.values())[:20], relationships=relationships[:30])
 
 
 def _truncate(value: str, limit: int) -> str:

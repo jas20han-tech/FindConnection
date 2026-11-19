@@ -14,7 +14,7 @@ from app.dependencies import repository_dependency
 from app.graph.repository import GraphRepository
 from app.reasoning import ppr_retriever
 from app.reasoning.community import community_overview
-from app.reasoning.path_finder import PathResult, describe_path, shortest_path
+from app.reasoning.path_finder import PathResult, all_simple_paths, describe_path, shortest_path
 from app.reasoning.router import RouteDecision, classify
 from app.reasoning.simulator import simulate_impact
 from app.reasoning.synthesizer import (
@@ -62,6 +62,33 @@ def _edges_between(edges: list[GraphEdge], node_ids: set[str], limit: int = 120)
     return selected[:limit]
 
 
+def _extract_two_entities(query: str, node_map: dict[str, GraphNode]) -> tuple[str | None, str | None]:
+    found = []
+    seen: set[str] = set()
+    for nid, node in sorted(node_map.items(), key=lambda x: len(x[1].name), reverse=True):
+        name = node.name
+        if not name:
+            continue
+        if name.lower() in query.lower() and nid not in seen:
+            found.append(nid)
+            seen.add(nid)
+            if len(found) >= 2:
+                break
+    if len(found) < 2:
+        for nid, node in sorted(node_map.items(), key=lambda x: len(x[1].name), reverse=True):
+            for alias in getattr(node, "aliases", []) or []:
+                al = str(alias).strip()
+                if not al:
+                    continue
+                if al.lower() in query.lower() and nid not in seen:
+                    found.append(nid)
+                    seen.add(nid)
+                    break
+            if len(found) >= 2:
+                break
+    return (found[0] if len(found) > 0 else None, found[1] if len(found) > 1 else None)
+
+
 async def build_outcome(payload: QueryRequest, repository: GraphRepository) -> QueryOutcome:
     started = time.perf_counter()
     nodes, edges = await repository.get_all()
@@ -87,11 +114,30 @@ async def build_outcome(payload: QueryRequest, repository: GraphRepository) -> Q
     explanation = decision.rationale
 
     if mode == "CONNECTION":
-        seeds = decision.seed_ids[:2]
+        seeds = list(decision.seed_ids[:2])
+        if len(seeds) < 2:
+            a, b = _extract_two_entities(payload.query, node_map)
+            if a and a not in seeds:
+                seeds.append(a)
+            if b and b not in seeds:
+                seeds.append(b)
+        # Also try to extract any two entities from the full query more aggressively
+        if len(seeds) < 2:
+            all_entities = []
+            ql = payload.query.lower()
+            for nid, node in node_map.items():
+                if node.name.lower() in ql:
+                    all_entities.append((nid, len(node.name)))
+            all_entities.sort(key=lambda x: x[1], reverse=True)
+            for nid, _ in all_entities:
+                if nid not in seeds:
+                    seeds.append(nid)
+                if len(seeds) >= 2:
+                    break
         ppr = ppr_retriever.personalized_pagerank(
             nodes,
             edges,
-            decision.seed_ids,
+            decision.seed_ids or seeds,
             max_year=year,
             top_k=payload.max_nodes,
         )
@@ -101,23 +147,54 @@ async def build_outcome(payload: QueryRequest, repository: GraphRepository) -> Q
                 active_edges,
                 seeds[0],
                 seeds[1],
-                max_hops=payload.max_hops,
+                max_hops=payload.max_hops if payload.max_hops >= 6 else 10,
                 max_year=year,
             )
-            if path.found:
+            if not path or not path.found:
+                for candidate in all_simple_paths(
+                    edges,
+                    seeds[0],
+                    seeds[1],
+                    max_hops=10,
+                    limit=10,
+                ):
+                    if candidate.found:
+                        path = candidate
+                        break
+            if not path or not path.found:
+                path = shortest_path(
+                    edges,
+                    seeds[0],
+                    seeds[1],
+                    max_hops=10,
+                    max_year=None,
+                )
+                if not path or not path.found:
+                    for candidate in all_simple_paths(
+                        edges,
+                        seeds[0],
+                        seeds[1],
+                        max_hops=10,
+                        limit=10,
+                    ):
+                        if candidate.found:
+                            path = candidate
+                            break
+            if path and path.found:
                 highlighted_nodes.update(path.node_ids)
                 highlighted_edges.update(path.edge_ids)
                 source = node_map.get(seeds[0])
                 target = node_map.get(seeds[1])
                 explanation = (
                     f"{explanation}. Found a {path.hops}-hop route between "
-                    f"{source.name if source else seeds[0]} and {target.name if target else seeds[1]}."
+                    f"{source.name if source else seeds[0]} and {target.name if target else seeds[1]} "
+                    f"through the story/relationships extracted from the PDF. Showing the full connection chain."
                 )
-            else:
-                explanation = f"{explanation}. {path.explanation}."
+            elif path and not path.found:
+                explanation = f"{explanation}. {path.explanation} - expanded search to full graph."
         if not highlighted_nodes:
             highlighted_nodes.update(ppr.node_ids[: payload.max_nodes])
-            if not decision.seed_ids:
+            if not decision.seed_ids and not seeds:
                 ranked = sorted(nodes, key=lambda node: node.pagerank, reverse=True)
                 highlighted_nodes.update(node.id for node in ranked[:12])
         highlighted_nodes.update(ppr.node_ids[: max(8, payload.max_nodes // 2)])
@@ -232,9 +309,22 @@ async def build_outcome(payload: QueryRequest, repository: GraphRepository) -> Q
         impact=impact,
         year=year or (payload.time_range[1] if payload.time_range else None),
     )
+    if mode == "CONNECTION" and path and path.found:
+        # Ensure the full path is highlighted on canvas
+        context.highlighted_edge_ids = sorted(set(context.highlighted_edge_ids) | set(path.edge_ids))
+        context.highlighted_node_ids = sorted(set(context.highlighted_node_ids) | set(path.node_ids))
+        # Also add any edges from those path nodes for more context
+        path_node_set = set(path.node_ids)
+        for e in edges:
+            if e.source in path_node_set and e.target in path_node_set and e.status != "DISSOLVED":
+                context.highlighted_edge_ids.append(e.id)
+                context.highlighted_node_ids.append(e.source)
+                context.highlighted_node_ids.append(e.target)
+        context.highlighted_edge_ids = sorted(set(context.highlighted_edge_ids))
+        context.highlighted_node_ids = sorted(set(context.highlighted_node_ids))
     citations = context.citations()
     confidence = confidence_for(
-        seeds=decision.seed_ids,
+        seeds=decision.seed_ids or (seeds if 'seeds' in locals() else []),
         path=path if path is not None else PathResult(found=bool(highlighted_edges)),
         citations=len(citations),
         mode=mode,  # type: ignore[arg-type]

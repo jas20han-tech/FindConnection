@@ -52,6 +52,7 @@ export function EntityDrawer({
   const impactLoading = useGraphStore((state) => state.impactLoading);
   const setImpact = useGraphStore((state) => state.setImpact);
   const hoverEdge = useGraphStore((state) => state.hoverEdge);
+  const hoveredEdgeId = useGraphStore((state) => state.hoveredEdgeId);
   const selectNode = useGraphStore((state) => state.selectNode);
   const setQueryText = useGraphStore((state) => state.setQueryText);
   const setQueryContext = useGraphStore((state) => state.setQueryContext);
@@ -305,12 +306,37 @@ export function EntityDrawer({
           </div>
         )}
 
+        {hoveredEdgeId && edgeMap.get(hoveredEdgeId) && (
+          <div className="rounded-xl border border-sky-500/40 bg-sky-950/30 p-3 shadow-lg backdrop-blur">
+            <div className="flex items-center justify-between text-[9px] font-mono uppercase tracking-wider text-sky-400">
+              <span className="flex items-center gap-1 font-semibold">
+                <Sparkles size={10} /> Connection Story
+              </span>
+              <span>{edgeMap.get(hoveredEdgeId)?.strength}/10</span>
+            </div>
+            <div className="mt-1.5 flex items-center gap-1.5 text-[11px] font-bold text-white">
+              <span>{nodeMap.get(edgeMap.get(hoveredEdgeId)!.source)?.name ?? edgeMap.get(hoveredEdgeId)!.source}</span>
+              <span className="text-sky-400 text-[9.5px]">──[{edgeMap.get(hoveredEdgeId)!.type}]──►</span>
+              <span>{nodeMap.get(edgeMap.get(hoveredEdgeId)!.target)?.name ?? edgeMap.get(hoveredEdgeId)!.target}</span>
+            </div>
+            <p className="mt-1.5 text-[10px] leading-relaxed text-slate-300">
+              {edgeMap.get(hoveredEdgeId)!.description || "Direct relationship recorded in the knowledge graph."}
+            </p>
+            {edgeMap.get(hoveredEdgeId)!.source_doc && (
+              <div className="mt-2 flex items-center justify-between border-t border-white/5 pt-1 text-[8.5px] font-mono text-slate-500">
+                <span className="truncate">Doc: {edgeMap.get(hoveredEdgeId)!.source_doc}</span>
+                {edgeMap.get(hoveredEdgeId)!.source_page ? <span>p. {edgeMap.get(hoveredEdgeId)!.source_page}</span> : null}
+              </div>
+            )}
+          </div>
+        )}
+
         {highlight.pathNodeIds.length > 1 && (
           <div className="space-y-1.5 rounded-xl border border-white/10 bg-slate-900/80 p-3">
             <div className="font-mono text-[9px] font-semibold uppercase tracking-[0.14em] text-slate-500">
               Traversed knowledge route
             </div>
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               {highlight.pathNodeIds.map((nodeId, index) => {
                 const pathNode = nodeMap.get(nodeId);
                 const edgeId = highlight.pathEdgeIds[index];
@@ -333,16 +359,23 @@ export function EntityDrawer({
                       </span>
                     </button>
                     {edge && (
-                      <button
-                        type="button"
-                        onMouseEnter={() => onHoverEdge(edge.id)}
-                        onMouseLeave={() => onHoverEdge(null)}
-                        onFocus={() => onHoverEdge(edge.id)}
-                        onBlur={() => onHoverEdge(null)}
-                        className="mt-0.5 pl-3 text-left font-mono text-[9px] text-slate-500 transition-colors hover:text-sky-300"
-                      >
-                        ↳ [{edge.type}]{edge.year ? ` (${edge.year})` : ""}
-                      </button>
+                      <div className="my-1 pl-3">
+                        <button
+                          type="button"
+                          onMouseEnter={() => onHoverEdge(edge.id)}
+                          onMouseLeave={() => onHoverEdge(null)}
+                          onFocus={() => onHoverEdge(edge.id)}
+                          onBlur={() => onHoverEdge(null)}
+                          className="text-left font-mono text-[9px] text-sky-400 font-semibold transition-colors hover:text-sky-300"
+                        >
+                          ↳ [{edge.type}]{edge.year ? ` (${edge.year})` : ""}
+                        </button>
+                        {edge.description && (
+                          <p className="mt-0.5 border-l border-sky-500/30 pl-1.5 text-[9.5px] leading-relaxed text-slate-400">
+                            {edge.description}
+                          </p>
+                        )}
+                      </div>
                     )}
                   </div>
                 );
@@ -352,28 +385,67 @@ export function EntityDrawer({
         )}
 
         {node && adjacent.length > 0 && (
-          <div className="space-y-1.5">
-            <div className="font-mono text-[9px] font-semibold uppercase tracking-[0.14em] text-slate-500">
-              Direct relationships
+          <div className="space-y-2">
+            <div className="flex items-center justify-between font-mono text-[9px] font-semibold uppercase tracking-[0.14em] text-slate-500">
+              <span>Direct relationships ({adjacent.length})</span>
+              <span className="text-[8px] text-slate-600">Story & Dynamic</span>
             </div>
             {adjacent.map(({ edge, other }) => (
-              <button
+              <div
                 key={edge.id}
-                type="button"
                 onMouseEnter={() => onHoverEdge(edge.id)}
                 onMouseLeave={() => onHoverEdge(null)}
-                onClick={() => other && onSelect(other.id)}
-                className="flex w-full items-center justify-between gap-2 rounded-lg border border-white/5 bg-slate-900/60 px-2 py-1.5 text-left transition-colors hover:border-white/15 hover:bg-slate-900"
+                className={`rounded-lg border transition-all ${
+                  hoveredEdgeId === edge.id
+                    ? "border-sky-500/50 bg-sky-950/30 shadow-md"
+                    : "border-white/5 bg-slate-900/60 hover:border-white/15 hover:bg-slate-900"
+                } p-2.5`}
               >
-                <span className="min-w-0">
-                  <span className="block truncate text-[10px] text-slate-300">{other?.name ?? "unknown"}</span>
-                  <span className="block font-mono text-[8.5px] uppercase tracking-wider text-slate-600">
-                    {edge.type}
-                    {edge.year ? ` · ${edge.year}` : ""}
-                  </span>
-                </span>
-                <span className="shrink-0 font-mono text-[9px] text-slate-500">{edge.strength}/10</span>
-              </button>
+                <div className="flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={() => other && onSelect(other.id)}
+                    className="flex items-center gap-1.5 text-left font-medium text-slate-200 transition-colors hover:text-white"
+                  >
+                    <span
+                      className="h-1.5 w-1.5 shrink-0 rounded-full"
+                      style={{ backgroundColor: other ? ENTITY_COLORS[other.type] : "#94A3B8" }}
+                    />
+                    <span className="truncate text-[10.5px] font-semibold">{other?.name ?? "unknown"}</span>
+                  </button>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <span className="rounded bg-sky-500/10 px-1.5 py-0.5 font-mono text-[8px] font-semibold text-sky-400">
+                      {edge.type.replace(/_/g, " ")}
+                    </span>
+                    <span className="font-mono text-[8.5px] text-slate-500">{edge.strength}/10</span>
+                  </div>
+                </div>
+
+                {edge.description ? (
+                  <p className="mt-1.5 border-l-2 border-sky-500/40 pl-2 text-[10px] leading-relaxed text-slate-400">
+                    {edge.description}
+                  </p>
+                ) : (
+                  <p className="mt-1 text-[9px] italic text-slate-500">Connected in knowledge graph.</p>
+                )}
+
+                <div className="mt-2 flex items-center justify-between border-t border-white/5 pt-1 font-mono text-[8.5px] text-slate-500">
+                  <span className="truncate max-w-[140px]">{edge.source_doc ? edge.source_doc.slice(0, 20) : "Document"}</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!other) return;
+                      setQueryContext({ mode: "CONNECTION" });
+                      setQueryText(`What is the story between ${node.name} and ${other.name}?`);
+                      const input = document.getElementById("omnibar-input") as HTMLInputElement | null;
+                      input?.focus();
+                    }}
+                    className="font-semibold text-sky-400 transition-colors hover:text-sky-300"
+                  >
+                    Trace story →
+                  </button>
+                </div>
+              </div>
             ))}
           </div>
         )}

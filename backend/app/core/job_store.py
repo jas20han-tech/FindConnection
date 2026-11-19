@@ -18,7 +18,7 @@ _memory: dict[str, dict[str, Any]] = {}
 
 STAGES: list[tuple[str, str, int]] = [
     ("QUEUED", "Queued", 0),
-    ("PARSING", "PyMuPDF Page Parser", 8),
+    ("PARSING", "Document Parser (Docling / PyMuPDF)", 8),
     ("CHUNKING", "Semantic Token Chunker", 16),
     ("EXTRACTING", "Structured LLM Extraction", 32),
     ("RESOLVING", "Entity Resolution Cascade", 58),
@@ -50,6 +50,10 @@ def new_job(filename: str) -> dict[str, Any]:
         "counts_by_type": {},
         "document_count": 0,
         "error_message": None,
+        "network_file": None,
+        "network_path": None,
+        "network_summary": None,
+        "network_error": None,
         "created_at": _now(),
         "updated_at": _now(),
         "completed_at": None,
